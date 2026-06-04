@@ -10,8 +10,11 @@ the token/key part, the script will find all robots whose token matches.
 
 import argparse
 import copy
+import json
+import os
 import sys
 import time
+from datetime import datetime
 from urllib.parse import parse_qs, urlparse
 
 import requests
@@ -22,9 +25,9 @@ ROBOT_TYPES = ["feishu", "dingtalk", "wecom", "slack", "telegram", "zoom"]
 def extract_key(token_or_url):
     """Extract the pure key/token from a value that might be a full webhook URL.
 
-    e.g. "https://qyapi.weixin.qq.com/...?key=abc" → "abc"
-         "https://oapi.dingtalk.com/...?access_token=abc" → "abc"
-         "abc" → "abc"
+    e.g. "https://qyapi.weixin.qq.com/...?key=abc" -> "abc"
+         "https://oapi.dingtalk.com/...?access_token=abc" -> "abc"
+         "abc" -> "abc"
     """
     if not token_or_url:
         return ""
@@ -103,7 +106,7 @@ def do_list(args):
         for ref in refs:
             ch_name = ref.get("channel_name") or f"channel:{ref.get('channel_id')}"
             rule_name = ref.get("escalate_rule_name") or ref.get("escalate_rule_id")
-            print(f"    → [{ch_name}] {rule_name}")
+            print(f"    -> [{ch_name}] {rule_name}")
 
         print("-" * 64)
 
@@ -172,6 +175,15 @@ def update_layers(layers, robot_type, search_token, new_token=None, new_alias=No
     return updated, changed
 
 
+def save_backup(backup_entries):
+    """Save backup to a JSON file in the current directory. Returns the file path."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"webhook_backup_{ts}.json"
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(backup_entries, f, ensure_ascii=False, indent=2)
+    return filename
+
+
 def do_update(args):
     if not args.token:
         print("[ERR]  --token is required for update")
@@ -216,7 +228,7 @@ def do_update(args):
     for ref in refs:
         ch_name = ref.get("channel_name") or f"channel:{ref.get('channel_id')}"
         rule_name = ref.get("escalate_rule_name") or ref.get("escalate_rule_id")
-        print(f"  → [{ch_name}] {rule_name}")
+        print(f"  -> [{ch_name}] {rule_name}")
 
     if args.dry_run:
         print("\n[DRY-RUN] No changes were made.")
@@ -224,7 +236,6 @@ def do_update(args):
 
     if not args.yes:
         print()
-        # Flush any buffered keystrokes (e.g. Enter pressed during API wait)
         try:
             import termios
             termios.tcflush(sys.stdin, termios.TCIFLUSH)
@@ -235,26 +246,31 @@ def do_update(args):
             print("[INFO] Aborted.")
             sys.exit(0)
 
-    success = 0
-    failed = 0
+    # Phase 1: fetch all rules and build backup
+    backup_entries = []
+    rules_to_update = []
 
     for ref in refs:
         channel_id = ref.get("channel_id")
         rule_id = ref.get("escalate_rule_id")
         rule_name = ref.get("escalate_rule_name") or rule_id
 
-        print(f"\n[INFO] Processing: [channel:{channel_id}] {rule_name}")
-
-        print("  [....] Fetching rule info...", end="", flush=True)
+        print(f"\n[INFO] Fetching: [channel:{channel_id}] {rule_name}", end="", flush=True)
         t0 = time.time()
         rule = api_post(args.base_url, args.app_key,
                         "/channel/escalate/rule/info",
                         {"channel_id": channel_id, "rule_id": rule_id})
         print(f" ({time.time() - t0:.1f}s)")
         if rule is None:
-            print("  [ERR]  Failed to fetch rule. Skipping.")
-            failed += 1
-            continue
+            print("  [ERR]  Failed to fetch rule. Aborting (no changes made).")
+            sys.exit(1)
+
+        backup_entries.append({
+            "channel_id": channel_id,
+            "rule_id": rule_id,
+            "rule_name": rule_name,
+            "original_rule": rule,
+        })
 
         new_layers, changed = update_layers(
             rule.get("layers", []),
@@ -264,9 +280,26 @@ def do_update(args):
             new_alias=args.new_alias,
         )
 
-        if not changed:
-            print("  [WARN] No matching webhook found in layers. Skipping.")
-            continue
+        if changed:
+            rules_to_update.append((ref, rule, new_layers))
+        else:
+            print(f"  [WARN] No matching webhook in layers. Skipping.")
+
+    if not rules_to_update:
+        print("\n[WARN] No rules to update.")
+        return
+
+    # Save backup before any writes
+    backup_file = save_backup(backup_entries)
+    print(f"\n[INFO] Backup saved to: {backup_file}")
+
+    # Phase 2: apply updates
+    success = 0
+    failed = 0
+
+    for ref, rule, new_layers in rules_to_update:
+        channel_id = ref.get("channel_id")
+        rule_name = ref.get("escalate_rule_name") or ref.get("escalate_rule_id")
 
         update_body = {
             "channel_id": rule["channel_id"],
@@ -280,19 +313,86 @@ def do_update(args):
             "filters": rule.get("filters"),
         }
 
-        print("  [....] Updating rule...", end="", flush=True)
+        print(f"  [....] Updating [{rule_name}]...", end="", flush=True)
         t0 = time.time()
         result = api_post(args.base_url, args.app_key,
                           "/channel/escalate/rule/update", update_body)
         print(f" ({time.time() - t0:.1f}s)")
         if result is not None:
-            print("  [ OK ] Updated successfully.")
+            print(f"  [ OK ] Updated successfully.")
             success += 1
         else:
-            print("  [ERR]  Update failed.")
+            print(f"  [ERR]  Update failed.")
             failed += 1
 
     print(f"\n[INFO] Done. Updated: {success}, Failed: {failed}")
+    print(f"[INFO] To rollback: python {sys.argv[0]} restore --app-key YOUR_KEY --backup {backup_file}")
+
+
+def do_restore(args):
+    if not args.backup:
+        print("[ERR]  --backup is required for restore")
+        sys.exit(1)
+
+    if not os.path.isfile(args.backup):
+        print(f"[ERR]  Backup file not found: {args.backup}")
+        sys.exit(1)
+
+    with open(args.backup, "r", encoding="utf-8") as f:
+        backup_entries = json.load(f)
+
+    print(f"[INFO] Loaded {len(backup_entries)} rule(s) from: {args.backup}")
+    print()
+
+    for entry in backup_entries:
+        rule = entry["original_rule"]
+        ch_name = f"channel:{entry['channel_id']}"
+        print(f"  -> [{ch_name}] {entry['rule_name']}")
+
+    if not args.yes:
+        print()
+        try:
+            import termios
+            termios.tcflush(sys.stdin, termios.TCIFLUSH)
+        except (ImportError, termios.error):
+            pass
+        confirm = input("Restore all rules to their original state? [y/N] ").strip()
+        if confirm.lower() != "y":
+            print("[INFO] Aborted.")
+            sys.exit(0)
+
+    success = 0
+    failed = 0
+
+    for entry in backup_entries:
+        rule = entry["original_rule"]
+        rule_name = entry["rule_name"]
+
+        update_body = {
+            "channel_id": rule["channel_id"],
+            "rule_id": rule["rule_id"],
+            "rule_name": rule["rule_name"],
+            "description": rule.get("description", ""),
+            "template_id": rule["template_id"],
+            "aggr_window": rule.get("aggr_window", 0),
+            "layers": rule.get("layers", []),
+            "time_filters": rule.get("time_filters", []),
+            "filters": rule.get("filters"),
+        }
+
+        print(f"\n  [....] Restoring [{rule_name}]...", end="", flush=True)
+        t0 = time.time()
+        result = api_post(args.base_url, args.app_key,
+                          "/channel/escalate/rule/update", update_body)
+        print(f" ({time.time() - t0:.1f}s)")
+        if result is not None:
+            print(f"  [ OK ] Restored successfully.")
+            success += 1
+        else:
+            print(f"  [ERR]  Restore failed.")
+            failed += 1
+
+    print(f"\n[INFO] Done. Restored: {success}, Failed: {failed}")
 
 
 def main():
@@ -304,20 +404,16 @@ Examples:
   # List all robots
   python %(prog)s list --app-key YOUR_KEY
 
-  # List only feishu robots
-  python %(prog)s list --app-key YOUR_KEY --type feishu
-
-  # Preview changes — token can be a full URL or just the key part
+  # Update robot token (auto-backup before update)
   python %(prog)s update --app-key YOUR_KEY \\
-      --type wecom --token "ddfbe30a-xxxx" --new-token "new-token" --dry-run
+      --type wecom --token "old-token" --new-token "new-token"
 
-  # Apply changes
-  python %(prog)s update --app-key YOUR_KEY \\
-      --type wecom --token "ddfbe30a-xxxx" --new-token "new-token"
+  # Rollback from backup
+  python %(prog)s restore --app-key YOUR_KEY --backup webhook_backup_20260604_160000.json
 """,
     )
 
-    parser.add_argument("action", choices=["list", "update"],
+    parser.add_argument("action", choices=["list", "update", "restore"],
                         help="Action to perform")
     parser.add_argument("--base-url", default="https://api.flashcat.cloud",
                         help="API base URL (default: https://api.flashcat.cloud)")
@@ -332,6 +428,8 @@ Examples:
                         help="New token/URL to replace with")
     parser.add_argument("--new-alias", default=None,
                         help="New alias/display name")
+    parser.add_argument("--backup", default=None,
+                        help="Backup file path (required for restore)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Show what would change without updating")
     parser.add_argument("--yes", action="store_true",
@@ -343,6 +441,8 @@ Examples:
         do_list(args)
     elif args.action == "update":
         do_update(args)
+    elif args.action == "restore":
+        do_restore(args)
 
 
 if __name__ == "__main__":

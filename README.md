@@ -52,15 +52,28 @@ Welcome to the Flashduty Tools repository! This repository contains various tool
        --new-token "new-token-or-url" --dry-run
    ```
 
-   **Step 3: Apply changes**:
+   **Step 3: Apply changes** (auto-backup before update):
    ```bash
    python webhook_robot_updater.py update --app-key YOUR_KEY \
        --type feishu --token "current-token-or-url" \
        --new-token "new-token-or-url"
+   # Output: Backup saved to: webhook_backup_20260604_160000.json
+   ```
+
+   **Step 4: Rollback** (if something went wrong, restore from backup):
+   ```bash
+   # Shell version
+   bash webhook_robot_updater.sh restore --app-key YOUR_KEY \
+       --backup webhook_backup_20260604_160000.json
+
+   # Python version
+   python webhook_robot_updater.py restore --app-key YOUR_KEY \
+       --backup webhook_backup_20260604_160000.json
    ```
 
    Options:
    - `--new-token` — Replace the webhook token/URL
    - `--new-alias` — Replace the display name
+   - `--backup` — Backup file path (required for `restore`)
    - `--dry-run` — Preview only, no changes
    - `--yes` — Skip confirmation prompts

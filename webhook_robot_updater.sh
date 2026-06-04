@@ -5,9 +5,7 @@ set -euo pipefail
 # Uses three existing APIs: robot/list, rule/info, rule/update.
 # Auth: app_key passed as query parameter (same as other flashduty tools).
 #
-# Supports smart matching: whether the user passes a full webhook URL or just
-# the token/key part, the script will find all robots whose token matches
-# (exact or key-extraction from URL).
+# Supports smart matching, backup before update, and restore from backup.
 
 ##############################################################################
 # Defaults & globals
@@ -20,6 +18,7 @@ DRY_RUN=false
 AUTO_YES=false
 NEW_TOKEN=""
 NEW_ALIAS=""
+BACKUP_FILE=""
 ACTION="list"
 
 RED='\033[0;31m'
@@ -34,8 +33,9 @@ NC='\033[0m'
 usage() {
     cat <<EOF
 Usage:
-  $(basename "$0") list   [options]            List all webhook robots
-  $(basename "$0") update [options]            Update a robot across all escalate rules
+  $(basename "$0") list    [options]           List all webhook robots
+  $(basename "$0") update  [options]           Update a robot (auto-backup before update)
+  $(basename "$0") restore [options]           Restore rules from a backup file
 
 Common options:
   --base-url URL        API base URL (default: https://api.flashcat.cloud)
@@ -43,27 +43,23 @@ Common options:
   --type     TYPE       Robot type filter: feishu, dingtalk, wecom, slack, telegram, zoom
 
 Update options:
-  --token     TOKEN     Current token/URL of the robot to update (required for update).
-                        Accepts either the full webhook URL or just the token/key part.
+  --token     TOKEN     Current token/URL of the robot to update (required)
   --new-token TOKEN     New token/URL to replace with
   --new-alias ALIAS     New alias/display name
   --dry-run             Show what would change without actually updating
   --yes                 Skip confirmation prompts
 
+Restore options:
+  --backup    FILE      Backup file to restore from (required)
+  --yes                 Skip confirmation prompts
+
 Examples:
-  # List all robots
   $(basename "$0") list --app-key YOUR_KEY
 
-  # List only feishu robots
-  $(basename "$0") list --app-key YOUR_KEY --type feishu
-
-  # Preview changes — token can be a full URL or just the key part
   $(basename "$0") update --app-key YOUR_KEY \\
-      --type wecom --token "ddfbe30a-xxxx" --new-token "new-token" --dry-run
+      --type wecom --token "old-token" --new-token "new-token"
 
-  # Apply changes
-  $(basename "$0") update --app-key YOUR_KEY \\
-      --type wecom --token "ddfbe30a-xxxx" --new-token "new-token"
+  $(basename "$0") restore --app-key YOUR_KEY --backup webhook_backup_20260604_160000.json
 EOF
     exit 1
 }
@@ -104,13 +100,9 @@ api_post() {
         return 1
     fi
 
-    # Unwrap the "data" envelope if present (single jq pass)
     printf '%s' "$response_body" | jq -c 'if .data != null then .data else . end'
 }
 
-# jq helper: extract the pure key/token from a value that might be a full URL.
-# e.g. "https://qyapi.weixin.qq.com/...?key=abc" → "abc"
-#      "abc" → "abc"
 JQ_EXTRACT_KEY='def extract_key:
   if test("[:?&]key=") then split("key=") | last | split("&") | first
   elif test("access_token=") then split("access_token=") | last | split("&") | first
@@ -134,14 +126,15 @@ parse_args() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --base-url)  BASE_URL="$2";   shift 2 ;;
-            --app-key)   APP_KEY="$2";    shift 2 ;;
-            --type)      ROBOT_TYPE="$2"; shift 2 ;;
-            --token)     OLD_TOKEN="$2";  shift 2 ;;
-            --new-token) NEW_TOKEN="$2";  shift 2 ;;
-            --new-alias) NEW_ALIAS="$2";  shift 2 ;;
-            --dry-run)   DRY_RUN=true;    shift   ;;
-            --yes)       AUTO_YES=true;   shift   ;;
+            --base-url)  BASE_URL="$2";    shift 2 ;;
+            --app-key)   APP_KEY="$2";     shift 2 ;;
+            --type)      ROBOT_TYPE="$2";  shift 2 ;;
+            --token)     OLD_TOKEN="$2";   shift 2 ;;
+            --new-token) NEW_TOKEN="$2";   shift 2 ;;
+            --new-alias) NEW_ALIAS="$2";   shift 2 ;;
+            --backup)    BACKUP_FILE="$2"; shift 2 ;;
+            --dry-run)   DRY_RUN=true;     shift   ;;
+            --yes)       AUTO_YES=true;    shift   ;;
             -h|--help)   usage ;;
             *)           log_err "Unknown option: $1"; usage ;;
         esac
@@ -170,7 +163,7 @@ do_list() {
     resp=$(api_post "/channel/escalate/webhook/robot/list" "$body") || exit 1
 
     local count
-    count=$(echo "$resp" | jq '.list | length')
+    count=$(printf '%s' "$resp" | jq '.list | length')
 
     if [[ "$count" -eq 0 ]]; then
         log_warn "No robots found."
@@ -179,19 +172,19 @@ do_list() {
 
     echo ""
     echo -e "${CYAN}Found $count robot(s):${NC}"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "================================================================"
 
     local idx=0
-    echo "$resp" | jq -r '.list[] | @base64' | while read -r item; do
+    printf '%s' "$resp" | jq -r '.list[] | @base64' | while read -r item; do
         idx=$((idx + 1))
         local decoded
         decoded=$(echo "$item" | base64 -d 2>/dev/null || echo "$item" | base64 -D 2>/dev/null)
 
         local rtype alias token ref_count
-        rtype=$(echo "$decoded" | jq -r '.type // "unknown"')
-        alias=$(echo "$decoded" | jq -r '.settings.alias // "(no alias)"')
-        token=$(echo "$decoded" | jq -r '.settings.token // "(no token)"')
-        ref_count=$(echo "$decoded" | jq '.referenced_by | length')
+        rtype=$(printf '%s' "$decoded" | jq -r '.type // "unknown"')
+        alias=$(printf '%s' "$decoded" | jq -r '.settings.alias // "(no alias)"')
+        token=$(printf '%s' "$decoded" | jq -r '.settings.token // "(no token)"')
+        ref_count=$(printf '%s' "$decoded" | jq '.referenced_by | length')
 
         echo -e "  #${idx}"
         echo -e "  Type:       ${GREEN}${rtype}${NC}"
@@ -199,9 +192,9 @@ do_list() {
         echo -e "  Token/URL:  ${token}"
         echo -e "  Referenced:  ${ref_count} escalate rule(s)"
 
-        echo "$decoded" | jq -r '.referenced_by[]? | "    → [\(.channel_name // "channel:\(.channel_id)")] \(.escalate_rule_name // .escalate_rule_id)"'
+        printf '%s' "$decoded" | jq -r '.referenced_by[]? | "    -> [\(.channel_name // "channel:\(.channel_id)")] \(.escalate_rule_name // .escalate_rule_id)"'
 
-        echo "────────────────────────────────────────────────────────────────"
+        echo "----------------------------------------------------------------"
     done
 }
 
@@ -232,17 +225,15 @@ do_update() {
     list_resp=$(api_post "/channel/escalate/webhook/robot/list" "$list_body") || exit 1
     echo " ($((SECONDS - t_search))s)"
 
-    # Smart match: extract key from both the search token and stored token, then compare.
-    # This handles URL-vs-key mismatches (e.g. full wecom URL vs bare key).
     local matches
-    matches=$(echo "$list_resp" | jq --arg tok "$OLD_TOKEN" "${JQ_EXTRACT_KEY}"'
+    matches=$(printf '%s' "$list_resp" | jq --arg tok "$OLD_TOKEN" "${JQ_EXTRACT_KEY}"'
         [.list[] | select(
             (.settings.token | extract_key) == ($tok | extract_key)
         )]
     ')
 
     local match_count
-    match_count=$(echo "$matches" | jq 'length')
+    match_count=$(printf '%s' "$matches" | jq 'length')
 
     if [[ "$match_count" -eq 0 ]]; then
         log_err "Robot not found with type=${ROBOT_TYPE} and token=${OLD_TOKEN}"
@@ -250,19 +241,17 @@ do_update() {
         exit 1
     fi
 
-    # Merge referenced_by from all matched robots (URL form + token form are the same robot)
     local all_refs
-    all_refs=$(echo "$matches" | jq -c '[.[].referenced_by[]] | unique_by(.escalate_rule_id)')
+    all_refs=$(printf '%s' "$matches" | jq -c '[.[].referenced_by[]] | unique_by(.escalate_rule_id)')
 
     local ref_count
-    ref_count=$(echo "$all_refs" | jq 'length')
+    ref_count=$(printf '%s' "$all_refs" | jq 'length')
 
-    # Collect all matched stored tokens for display and later matching
     local matched_tokens
-    matched_tokens=$(echo "$matches" | jq -r '[.[].settings.token] | unique | join(", ")')
+    matched_tokens=$(printf '%s' "$matches" | jq -r '[.[].settings.token] | unique | join(", ")')
 
     local current_alias
-    current_alias=$(echo "$matches" | jq -r '.[0].settings.alias // "(no alias)"')
+    current_alias=$(printf '%s' "$matches" | jq -r '.[0].settings.alias // "(no alias)"')
 
     if [[ "$ref_count" -eq 0 ]]; then
         log_warn "Robot found but not referenced by any escalate rules. Nothing to update."
@@ -287,7 +276,7 @@ do_update() {
 
     if [[ "$DRY_RUN" == true ]]; then
         echo -e "${YELLOW}[DRY-RUN] The following rules would be updated:${NC}"
-        echo "$all_refs" | jq -r '.[] | "  → [\(.channel_name // "channel:\(.channel_id)")] \(.escalate_rule_name // .escalate_rule_id)"'
+        printf '%s' "$all_refs" | jq -r '.[] | "  -> [\(.channel_name // "channel:\(.channel_id)")] \(.escalate_rule_name // .escalate_rule_id)"'
         echo ""
         log_info "Dry-run complete. No changes were made."
         return
@@ -295,9 +284,8 @@ do_update() {
 
     if [[ "$AUTO_YES" != true ]]; then
         echo -e "${YELLOW}Affected rules:${NC}"
-        echo "$all_refs" | jq -r '.[] | "  → [\(.channel_name // "channel:\(.channel_id)")] \(.escalate_rule_name // .escalate_rule_id)"'
+        printf '%s' "$all_refs" | jq -r '.[] | "  -> [\(.channel_name // "channel:\(.channel_id)")] \(.escalate_rule_name // .escalate_rule_id)"'
         echo ""
-        # Flush any buffered keystrokes (e.g. Enter pressed during API wait)
         read -r -d '' -t 0.1 -n 10000 _discard < /dev/tty 2>/dev/null || true
         read -rp "Proceed with update? [y/N] " confirm < /dev/tty
         if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
@@ -306,37 +294,73 @@ do_update() {
         fi
     fi
 
-    local success=0
-    local failed=0
+    # Phase 1: fetch all rules and build backup
+    local backup_json="["
+    local first_entry=true
+    local rules_data=""
     local refs
-    refs=$(echo "$all_refs" | jq -c '.[]')
+    refs=$(printf '%s' "$all_refs" | jq -c '.[]')
 
     while read -r ref; do
         [[ -z "$ref" ]] && continue
 
         local channel_id rule_id rule_name
-        channel_id=$(echo "$ref" | jq -r '.channel_id')
-        rule_id=$(echo "$ref" | jq -r '.escalate_rule_id')
-        rule_name=$(echo "$ref" | jq -r '.escalate_rule_name // .escalate_rule_id')
+        channel_id=$(printf '%s' "$ref" | jq -r '.channel_id')
+        rule_id=$(printf '%s' "$ref" | jq -r '.escalate_rule_id')
+        rule_name=$(printf '%s' "$ref" | jq -r '.escalate_rule_name // .escalate_rule_id')
 
-        log_info "Processing: [channel:${channel_id}] ${rule_name}"
-
+        echo -ne "  ${CYAN}[....]${NC} Fetching [${rule_name}]..."
+        local t0=$SECONDS
         local info_body
-        info_body=$(jq -n \
-            --argjson cid "$channel_id" \
-            --arg rid "$rule_id" \
+        info_body=$(jq -n --argjson cid "$channel_id" --arg rid "$rule_id" \
             '{"channel_id": $cid, "rule_id": $rid}')
 
-        echo -ne "  ${CYAN}[....]${NC} Fetching rule info..."
-        local t0=$SECONDS
         local rule_resp
         if ! rule_resp=$(api_post "/channel/escalate/rule/info" "$info_body"); then
             echo " ($((SECONDS - t0))s)"
-            log_err "  Failed to fetch rule. Skipping."
-            failed=$((failed + 1))
-            continue
+            log_err "  Failed to fetch rule. Aborting (no changes made)."
+            exit 1
         fi
         echo " ($((SECONDS - t0))s)"
+
+        # Append to backup JSON
+        local entry
+        entry=$(jq -n --argjson cid "$channel_id" --arg rid "$rule_id" \
+            --arg rname "$rule_name" --argjson rule "$rule_resp" \
+            '{channel_id: $cid, rule_id: $rid, rule_name: $rname, original_rule: $rule}')
+
+        if [[ "$first_entry" == true ]]; then
+            backup_json="${backup_json}${entry}"
+            first_entry=false
+        else
+            backup_json="${backup_json},${entry}"
+        fi
+
+        # Store for phase 2
+        rules_data="${rules_data}${ref}|${rule_resp}"$'\n'
+    done <<< "$refs"
+
+    backup_json="${backup_json}]"
+
+    # Save backup
+    local backup_file
+    backup_file="webhook_backup_$(date +%Y%m%d_%H%M%S).json"
+    printf '%s' "$backup_json" | jq '.' > "$backup_file"
+    echo ""
+    log_info "Backup saved to: ${backup_file}"
+
+    # Phase 2: apply updates
+    local success=0
+    local failed=0
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+
+        local ref_part="${line%%|*}"
+        local rule_resp="${line#*|}"
+
+        local rule_name
+        rule_name=$(printf '%s' "$ref_part" | jq -r '.escalate_rule_name // .escalate_rule_id')
 
         local jq_filter
         jq_filter=$(build_jq_update_filter)
@@ -351,7 +375,7 @@ do_update() {
 
         local new_layers
         if ! new_layers=$(printf '%s' "$rule_resp" | jq -c "${jq_args[@]}" "$jq_filter"); then
-            log_err "  Failed to transform layers. Skipping."
+            log_err "  Failed to transform layers for [${rule_name}]. Skipping."
             failed=$((failed + 1))
             continue
         fi
@@ -371,8 +395,8 @@ do_update() {
                 filters: .filters
             }')
 
-        echo -ne "  ${CYAN}[....]${NC} Updating rule..."
-        t0=$SECONDS
+        echo -ne "  ${CYAN}[....]${NC} Updating [${rule_name}]..."
+        local t0=$SECONDS
         if api_post "/channel/escalate/rule/update" "$update_body" > /dev/null; then
             echo " ($((SECONDS - t0))s)"
             log_ok "  Updated successfully."
@@ -382,10 +406,79 @@ do_update() {
             log_err "  Update failed."
             failed=$((failed + 1))
         fi
-    done <<< "$refs"
+    done <<< "$rules_data"
 
     echo ""
     log_info "Done. Updated: ${success}, Failed: ${failed}"
+    log_info "To rollback: $(basename "$0") restore --app-key YOUR_KEY --backup ${backup_file}"
+}
+
+##############################################################################
+# Action: restore
+##############################################################################
+do_restore() {
+    if [[ -z "$BACKUP_FILE" ]]; then
+        log_err "--backup is required for restore"
+        exit 1
+    fi
+
+    if [[ ! -f "$BACKUP_FILE" ]]; then
+        log_err "Backup file not found: $BACKUP_FILE"
+        exit 1
+    fi
+
+    local entry_count
+    entry_count=$(jq 'length' "$BACKUP_FILE")
+    log_info "Loaded ${entry_count} rule(s) from: ${BACKUP_FILE}"
+    echo ""
+
+    jq -r '.[] | "  -> [channel:\(.channel_id)] \(.rule_name)"' "$BACKUP_FILE"
+
+    if [[ "$AUTO_YES" != true ]]; then
+        echo ""
+        read -r -d '' -t 0.1 -n 10000 _discard < /dev/tty 2>/dev/null || true
+        read -rp "Restore all rules to their original state? [y/N] " confirm < /dev/tty
+        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+            log_info "Aborted."
+            exit 0
+        fi
+    fi
+
+    local success=0
+    local failed=0
+
+    jq -c '.[]' "$BACKUP_FILE" | while read -r entry; do
+        local rule_name
+        rule_name=$(printf '%s' "$entry" | jq -r '.rule_name')
+
+        local update_body
+        update_body=$(printf '%s' "$entry" | jq -c '.original_rule | {
+            channel_id: .channel_id,
+            rule_id: .rule_id,
+            rule_name: .rule_name,
+            description: .description,
+            template_id: .template_id,
+            aggr_window: .aggr_window,
+            layers: .layers,
+            time_filters: .time_filters,
+            filters: .filters
+        }')
+
+        echo -ne "  ${CYAN}[....]${NC} Restoring [${rule_name}]..."
+        local t0=$SECONDS
+        if api_post "/channel/escalate/rule/update" "$update_body" > /dev/null; then
+            echo " ($((SECONDS - t0))s)"
+            log_ok "  Restored successfully."
+            success=$((success + 1))
+        else
+            echo " ($((SECONDS - t0))s)"
+            log_err "  Restore failed."
+            failed=$((failed + 1))
+        fi
+    done
+
+    echo ""
+    log_info "Done. Restored: ${success}, Failed: ${failed}"
 }
 
 build_jq_update_filter() {
@@ -418,9 +511,10 @@ main() {
     parse_args "$@"
 
     case "$ACTION" in
-        list)   do_list   ;;
-        update) do_update ;;
-        *)      log_err "Unknown action: $ACTION"; usage ;;
+        list)    do_list    ;;
+        update)  do_update  ;;
+        restore) do_restore ;;
+        *)       log_err "Unknown action: $ACTION"; usage ;;
     esac
 }
 
